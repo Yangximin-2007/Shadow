@@ -6,7 +6,10 @@
 import { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI } from '@google/genai';
 import Markdown from 'react-markdown';
-import { Send, Bot, User, Briefcase, BookOpen, Settings, BarChart3, Database, Shield, Paperclip, X, FileText, Image as ImageIcon } from 'lucide-react';
+import { Send, Bot, User, Briefcase, BookOpen, Settings, BarChart3, Database, Shield, Paperclip, X, FileText, Image as ImageIcon, LogOut, Loader2 } from 'lucide-react';
+import { auth, db, googleProvider } from './firebase';
+import { signInWithPopup, signOut, onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import { collection, query, orderBy, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
 
 // Initialize Gemini API
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -36,6 +39,7 @@ type Message = {
   role: 'user' | 'model';
   content: string;
   attachments?: Attachment[];
+  createdAt?: any;
 };
 
 const fileToBase64 = (file: File): Promise<string> => {
@@ -52,18 +56,59 @@ const fileToBase64 = (file: File): Promise<string> => {
 };
 
 export default function App() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: '1',
-      role: 'model',
-      content: 'System initialized. Shadow AI online. Awaiting your directives for investment analysis or CFA study integration, Boss.'
-    }
-  ]);
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [attachments, setAttachments] = useState<File[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Auth Listener
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Firestore Messages Listener
+  useEffect(() => {
+    if (!user) {
+      setMessages([]);
+      return;
+    }
+
+    const q = query(
+      collection(db, 'users', user.uid, 'messages'),
+      orderBy('createdAt', 'asc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fetchedMessages: Message[] = [];
+      snapshot.forEach((doc) => {
+        fetchedMessages.push({ id: doc.id, ...doc.data() } as Message);
+      });
+      
+      // If no messages, we can inject the initial greeting locally
+      if (fetchedMessages.length === 0) {
+        setMessages([{
+          id: 'system-init',
+          role: 'model',
+          content: 'System initialized. Shadow AI online. Awaiting your directives for investment analysis or CFA study integration, Boss.'
+        }]);
+      } else {
+        setMessages(fetchedMessages);
+      }
+    }, (error) => {
+      console.error("Firestore error:", error);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -73,8 +118,24 @@ export default function App() {
     scrollToBottom();
   }, [messages]);
 
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (error) {
+      console.error("Login failed:", error);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (error) {
+      console.error("Logout failed:", error);
+    }
+  };
+
   const handleSend = async () => {
-    if ((!input.trim() && attachments.length === 0) || isLoading) return;
+    if ((!input.trim() && attachments.length === 0) || isLoading || !user) return;
 
     setIsLoading(true);
 
@@ -101,19 +162,21 @@ export default function App() {
         });
       }
 
-      const userMessage: Message = { 
-        id: Date.now().toString(), 
+      const userMessageData = { 
         role: 'user', 
         content: input,
-        attachments: newAttachments
+        attachments: newAttachments,
+        createdAt: serverTimestamp()
       };
       
-      setMessages((prev) => [...prev, userMessage]);
+      // Save user message to Firestore
+      await addDoc(collection(db, 'users', user.uid, 'messages'), userMessageData);
+      
       setInput('');
       setAttachments([]);
 
-      // Format history for Gemini API
-      const history = messages.map(msg => {
+      // Format history for Gemini API (excluding the local system-init message if it wasn't saved)
+      const history = messages.filter(m => m.id !== 'system-init').map(msg => {
         const parts: any[] = [{ text: msg.content }];
         if (msg.attachments) {
           msg.attachments.forEach(att => {
@@ -136,23 +199,26 @@ export default function App() {
         ],
         config: {
           systemInstruction: SYSTEM_INSTRUCTION,
-          temperature: 0.2, // Low temperature for more analytical, deterministic responses
+          temperature: 0.2,
         }
       });
 
-      const modelMessage: Message = {
-        id: (Date.now() + 1).toString(),
+      const modelMessageData = {
         role: 'model',
         content: response.text || 'No response generated.',
+        createdAt: serverTimestamp()
       };
 
-      setMessages((prev) => [...prev, modelMessage]);
+      // Save model message to Firestore
+      await addDoc(collection(db, 'users', user.uid, 'messages'), modelMessageData);
+
     } catch (error) {
-      console.error("Error calling Gemini:", error);
+      console.error("Error calling Gemini or Firestore:", error);
+      // Fallback local error message
       setMessages((prev) => [...prev, {
         id: Date.now().toString(),
         role: 'model',
-        content: '⚠️ **System Error:** Connection to core logic failed. Please check API configuration.'
+        content: '⚠️ **System Error:** Connection to core logic or database failed. Please check API configuration or file size limits (Firestore max 1MB per document).'
       }]);
     } finally {
       setIsLoading(false);
@@ -165,6 +231,37 @@ export default function App() {
       handleSend();
     }
   };
+
+  if (!isAuthReady) {
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-zinc-950 text-emerald-500">
+        <Loader2 className="w-8 h-8 animate-spin" />
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-zinc-950 text-zinc-300 font-sans">
+        <div className="max-w-md w-full p-8 bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl text-center">
+          <div className="flex justify-center mb-6">
+            <div className="w-16 h-16 bg-emerald-900/30 border border-emerald-800/50 rounded-2xl flex items-center justify-center text-emerald-500">
+              <Shield size={32} />
+            </div>
+          </div>
+          <h1 className="text-2xl font-bold text-zinc-100 mb-2 tracking-tight">Shadow Capital</h1>
+          <p className="text-zinc-500 mb-8 text-sm">Secure terminal access required. Please authenticate to access your shadow workspace.</p>
+          <button 
+            onClick={handleLogin}
+            className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-medium transition-colors flex items-center justify-center gap-2"
+          >
+            <User size={18} />
+            Authenticate with Google
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-zinc-950 text-zinc-300 font-sans overflow-hidden">
@@ -191,9 +288,19 @@ export default function App() {
         </div>
 
         <div className="p-4 border-t border-zinc-800">
-          <button className="flex items-center gap-2 text-sm text-zinc-400 hover:text-zinc-100 transition-colors w-full p-2 rounded-md hover:bg-zinc-800/50">
-            <Settings size={18} />
-            <span>System Config</span>
+          <div className="flex items-center gap-3 px-3 py-3 mb-2 bg-zinc-950 rounded-lg border border-zinc-800">
+            <img src={user.photoURL || ''} alt="User" className="w-8 h-8 rounded-full bg-zinc-800" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-zinc-200 truncate">{user.displayName}</p>
+              <p className="text-xs text-zinc-500 truncate">Founder</p>
+            </div>
+          </div>
+          <button 
+            onClick={handleLogout}
+            className="flex items-center gap-2 text-sm text-zinc-400 hover:text-red-400 transition-colors w-full p-2 rounded-md hover:bg-zinc-800/50"
+          >
+            <LogOut size={18} />
+            <span>Disconnect</span>
           </button>
         </div>
       </div>
