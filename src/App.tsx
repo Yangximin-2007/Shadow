@@ -4,15 +4,11 @@
  */
 
 import { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI } from '@google/genai';
 import Markdown from 'react-markdown';
-import { Send, Bot, User, Briefcase, BookOpen, Settings, BarChart3, Database, Shield, Paperclip, X, FileText, Image as ImageIcon, LogOut, Loader2, Cpu } from 'lucide-react';
+import { Send, Bot, User, Briefcase, BookOpen, Settings, BarChart3, Database, Shield, Paperclip, X, FileText, Image as ImageIcon, LogOut, Loader2, Cpu, Terminal } from 'lucide-react';
 import { auth, db, googleProvider } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { collection, query, orderBy, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
-
-// Initialize Gemini API
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // The CFA / PE Analyst System Prompt
 const SYSTEM_INSTRUCTION = `
@@ -64,7 +60,6 @@ export default function App() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [attachments, setAttachments] = useState<File[]>([]);
-  const [useOllama, setUseOllama] = useState(false);
   const [ollamaModel, setOllamaModel] = useState('llama3');
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -142,14 +137,13 @@ export default function App() {
     if ((!input.trim() && attachments.length === 0) || isLoading || !user) return;
 
     setIsLoading(true);
-    setStatusMessage(useOllama ? "Connecting to local engine..." : "Shadow is thinking...");
+    setStatusMessage(`Connecting to Ollama (${ollamaModel})...`);
 
     try {
       const newAttachments: Attachment[] = [];
-      const currentParts: any[] = [];
       
       if (input.trim()) {
-        currentParts.push({ text: input });
+        // Text is handled in the chat body
       }
 
       for (const file of attachments) {
@@ -158,12 +152,6 @@ export default function App() {
           name: file.name,
           mimeType: file.type,
           data: base64Data
-        });
-        currentParts.push({
-          inlineData: {
-            data: base64Data,
-            mimeType: file.type
-          }
         });
       }
 
@@ -174,7 +162,6 @@ export default function App() {
         createdAt: serverTimestamp()
       };
       
-      // Save user message to Firestore
       await addDoc(collection(db, 'users', user.uid, 'messages'), userMessageData);
       
       setInput('');
@@ -182,70 +169,52 @@ export default function App() {
 
       let fullResponse = '';
 
-      if (useOllama) {
-        // Local Ollama Logic (Non-streaming for now to ensure stability)
-        try {
-          const ollamaHistory = messages.filter(m => m.id !== 'system-init').map(msg => ({
-            role: msg.role === 'model' ? 'assistant' : 'user',
-            content: msg.content
-          }));
+      // Local Ollama Logic with Streaming
+      try {
+        const ollamaHistory = messages.filter(m => m.id !== 'system-init').map(msg => ({
+          role: msg.role === 'model' ? 'assistant' : 'user',
+          content: msg.content
+        }));
 
-          const response = await fetch('http://localhost:11434/api/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: ollamaModel,
-              messages: [
-                { role: 'system', content: SYSTEM_INSTRUCTION },
-                ...ollamaHistory,
-                { role: 'user', content: input }
-              ],
-              stream: false,
-            }),
-          });
+        const response = await fetch('http://localhost:11434/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: ollamaModel,
+            messages: [
+              { role: 'system', content: SYSTEM_INSTRUCTION },
+              ...ollamaHistory,
+              { role: 'user', content: input }
+            ],
+            stream: true,
+          }),
+        });
 
-          if (!response.ok) throw new Error('Ollama connection failed. Ensure Ollama is running with OLLAMA_ORIGINS="*"');
+        if (!response.ok) throw new Error('Ollama connection failed. Run: OLLAMA_ORIGINS="*" ollama serve');
+        
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error('Failed to read response stream');
+
+        setStatusMessage(null);
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = new TextDecoder().decode(value);
+          const lines = chunk.split('\n');
           
-          const data = await response.json();
-          fullResponse = data.message.content;
-        } catch (err) {
-          throw new Error('Ollama Error: ' + (err instanceof Error ? err.message : String(err)));
-        }
-      } else {
-        // Gemini Logic with STREAMING
-        const history = messages.filter(m => m.id !== 'system-init').map(msg => {
-          const parts: any[] = [{ text: msg.content }];
-          if (msg.attachments) {
-            msg.attachments.forEach(att => {
-              parts.push({
-                inlineData: {
-                  data: att.data,
-                  mimeType: att.mimeType
-                }
-              });
-            });
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            const json = JSON.parse(line);
+            if (json.message?.content) {
+              fullResponse += json.message.content;
+              setStreamingMessage(fullResponse);
+            }
           }
-          return { role: msg.role, parts };
-        });
-
-        const stream = await ai.models.generateContentStream({
-          model: 'gemini-3-flash-preview',
-          contents: [
-            ...history,
-            { role: 'user', parts: currentParts }
-          ],
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            temperature: 0.2,
-          }
-        });
-
-        setStatusMessage(null); // Clear status once stream starts
-
-        for await (const chunk of stream) {
-          fullResponse += chunk.text;
-          setStreamingMessage(fullResponse);
         }
+      } catch (err) {
+        throw new Error('Ollama Error: ' + (err instanceof Error ? err.message : String(err)));
       }
 
       const modelMessageData = {
@@ -254,19 +223,17 @@ export default function App() {
         createdAt: serverTimestamp()
       };
 
-      // Save model message to Firestore
       await addDoc(collection(db, 'users', user.uid, 'messages'), modelMessageData);
       setStreamingMessage(null);
 
     } catch (error) {
-      console.error("Error calling AI or Firestore:", error);
+      console.error("Ollama Error:", error);
       setStatusMessage(null);
       setStreamingMessage(null);
       
-      // Add error message to Firestore so it persists and is visible
       await addDoc(collection(db, 'users', user.uid, 'messages'), {
         role: 'model',
-        content: `⚠️ **System Error:** ${error instanceof Error ? error.message : 'Connection failed.'} \n\n*Tip: If using Ollama, ensure it is running locally with CORS enabled.*`,
+        content: `⚠️ **Ollama Connection Error:** ${error instanceof Error ? error.message : 'Failed to connect.'} \n\n**Quick Fix:**\n1. Open Terminal\n2. Run: \`OLLAMA_ORIGINS="*" ollama serve\`\n3. Ensure model \`${ollamaModel}\` is downloaded (\`ollama pull ${ollamaModel}\`)`,
         createdAt: serverTimestamp()
       });
     } finally {
@@ -336,33 +303,23 @@ export default function App() {
             <SidebarItem icon={<Briefcase size={18} />} label="Portfolio Models" />
           </nav>
 
-          <div className="px-4 mt-8 mb-2 text-xs font-semibold text-zinc-500 uppercase tracking-wider">Compute Engine</div>
+          <div className="px-4 mt-8 mb-2 text-xs font-semibold text-zinc-500 uppercase tracking-wider">Local Engine</div>
           <div className="px-4 space-y-3">
-            <div className="flex items-center justify-between p-2 bg-zinc-950 rounded-lg border border-zinc-800">
-              <div className="flex items-center gap-2">
-                <Cpu size={14} className={useOllama ? "text-emerald-500" : "text-zinc-500"} />
-                <span className="text-xs font-medium">Ollama Mode</span>
-              </div>
-              <button 
-                onClick={() => setUseOllama(!useOllama)}
-                className={`w-8 h-4 rounded-full transition-colors relative ${useOllama ? 'bg-emerald-600' : 'bg-zinc-700'}`}
-              >
-                <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${useOllama ? 'left-4.5' : 'left-0.5'}`} />
-              </button>
+            <div className="flex items-center gap-2 p-2 bg-zinc-950 rounded-lg border border-zinc-800 text-emerald-500">
+              <Terminal size={14} />
+              <span className="text-xs font-mono">Ollama Active</span>
             </div>
             
-            {useOllama && (
-              <select 
-                value={ollamaModel}
-                onChange={(e) => setOllamaModel(e.target.value)}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-2 text-xs text-zinc-300 focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
-              >
-                <option value="llama3">Llama 3 (8B)</option>
-                <option value="llama3:70b">Llama 3 (70B)</option>
-                <option value="mistral">Mistral</option>
-                <option value="phi3">Phi-3</option>
-              </select>
-            )}
+            <select 
+              value={ollamaModel}
+              onChange={(e) => setOllamaModel(e.target.value)}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-2 text-xs text-zinc-300 focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
+            >
+              <option value="llama3">Llama 3 (8B)</option>
+              <option value="cfa-shadow">CFA Shadow (Custom)</option>
+              <option value="mistral">Mistral</option>
+              <option value="deepseek-v2">DeepSeek V2</option>
+            </select>
           </div>
         </div>
 
@@ -393,8 +350,8 @@ export default function App() {
             <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
             <h2 className="font-medium text-zinc-100">Terminal: Shadow</h2>
           </div>
-          <div className="text-xs font-mono text-zinc-500 bg-zinc-900 px-3 py-1 rounded-full border border-zinc-800">
-            ENGINE: {useOllama ? `OLLAMA (${ollamaModel.toUpperCase()})` : 'GEMINI-3-FLASH'}
+          <div className="text-xs font-mono text-zinc-500 bg-zinc-900 px-3 py-1 rounded-full border border-zinc-800 uppercase">
+            ENGINE: OLLAMA ({ollamaModel})
           </div>
         </header>
 
