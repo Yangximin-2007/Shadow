@@ -60,11 +60,13 @@ export default function App() {
   const [isAuthReady, setIsAuthReady] = useState(false);
   
   const [messages, setMessages] = useState<Message[]>([]);
+  const [streamingMessage, setStreamingMessage] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [attachments, setAttachments] = useState<File[]>([]);
   const [useOllama, setUseOllama] = useState(false);
   const [ollamaModel, setOllamaModel] = useState('llama3');
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -140,6 +142,7 @@ export default function App() {
     if ((!input.trim() && attachments.length === 0) || isLoading || !user) return;
 
     setIsLoading(true);
+    setStatusMessage(useOllama ? "Connecting to local engine..." : "Shadow is thinking...");
 
     try {
       const newAttachments: Attachment[] = [];
@@ -177,10 +180,10 @@ export default function App() {
       setInput('');
       setAttachments([]);
 
-      let modelResponseText = '';
+      let fullResponse = '';
 
       if (useOllama) {
-        // Local Ollama Logic
+        // Local Ollama Logic (Non-streaming for now to ensure stability)
         try {
           const ollamaHistory = messages.filter(m => m.id !== 'system-init').map(msg => ({
             role: msg.role === 'model' ? 'assistant' : 'user',
@@ -204,12 +207,12 @@ export default function App() {
           if (!response.ok) throw new Error('Ollama connection failed. Ensure Ollama is running with OLLAMA_ORIGINS="*"');
           
           const data = await response.json();
-          modelResponseText = data.message.content;
+          fullResponse = data.message.content;
         } catch (err) {
           throw new Error('Ollama Error: ' + (err instanceof Error ? err.message : String(err)));
         }
       } else {
-        // Gemini Logic
+        // Gemini Logic with STREAMING
         const history = messages.filter(m => m.id !== 'system-init').map(msg => {
           const parts: any[] = [{ text: msg.content }];
           if (msg.attachments) {
@@ -225,8 +228,8 @@ export default function App() {
           return { role: msg.role, parts };
         });
 
-        const response = await ai.models.generateContent({
-          model: 'gemini-3.1-pro-preview',
+        const stream = await ai.models.generateContentStream({
+          model: 'gemini-3-flash-preview',
           contents: [
             ...history,
             { role: 'user', parts: currentParts }
@@ -236,28 +239,39 @@ export default function App() {
             temperature: 0.2,
           }
         });
-        modelResponseText = response.text || 'No response generated.';
+
+        setStatusMessage(null); // Clear status once stream starts
+
+        for await (const chunk of stream) {
+          fullResponse += chunk.text;
+          setStreamingMessage(fullResponse);
+        }
       }
 
       const modelMessageData = {
         role: 'model',
-        content: modelResponseText,
+        content: fullResponse,
         createdAt: serverTimestamp()
       };
 
       // Save model message to Firestore
       await addDoc(collection(db, 'users', user.uid, 'messages'), modelMessageData);
+      setStreamingMessage(null);
 
     } catch (error) {
       console.error("Error calling AI or Firestore:", error);
-      // Fallback local error message
-      setMessages((prev) => [...prev, {
-        id: Date.now().toString(),
+      setStatusMessage(null);
+      setStreamingMessage(null);
+      
+      // Add error message to Firestore so it persists and is visible
+      await addDoc(collection(db, 'users', user.uid, 'messages'), {
         role: 'model',
-        content: `⚠️ **System Error:** ${error instanceof Error ? error.message : 'Connection failed.'} \n\n*Tip: If using Ollama, ensure it is running locally with CORS enabled.*`
-      }]);
+        content: `⚠️ **System Error:** ${error instanceof Error ? error.message : 'Connection failed.'} \n\n*Tip: If using Ollama, ensure it is running locally with CORS enabled.*`,
+        createdAt: serverTimestamp()
+      });
     } finally {
       setIsLoading(false);
+      setStatusMessage(null);
     }
   };
 
@@ -380,7 +394,7 @@ export default function App() {
             <h2 className="font-medium text-zinc-100">Terminal: Shadow</h2>
           </div>
           <div className="text-xs font-mono text-zinc-500 bg-zinc-900 px-3 py-1 rounded-full border border-zinc-800">
-            ENGINE: {useOllama ? `OLLAMA (${ollamaModel.toUpperCase()})` : 'GEMINI-3.1-PRO'}
+            ENGINE: {useOllama ? `OLLAMA (${ollamaModel.toUpperCase()})` : 'GEMINI-3-FLASH'}
           </div>
         </header>
 
@@ -423,17 +437,38 @@ export default function App() {
               </div>
             </div>
           ))}
-          {isLoading && (
+
+          {/* Streaming Message */}
+          {streamingMessage && (
             <div className="flex gap-4 max-w-4xl mx-auto">
               <div className="w-8 h-8 rounded-md bg-emerald-900/30 text-emerald-500 border border-emerald-800/50 flex items-center justify-center shrink-0">
                 <Bot size={18} />
               </div>
               <div className="flex flex-col items-start">
                 <div className="text-xs text-zinc-500 mb-1 font-mono">SHADOW</div>
-                <div className="flex gap-1 mt-2">
-                  <div className="w-1.5 h-1.5 bg-emerald-500/50 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
-                  <div className="w-1.5 h-1.5 bg-emerald-500/50 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
-                  <div className="w-1.5 h-1.5 bg-emerald-500/50 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                <div className="prose prose-invert max-w-none text-sm text-zinc-300 leading-relaxed">
+                  <Markdown>{streamingMessage}</Markdown>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {isLoading && !streamingMessage && (
+            <div className="flex gap-4 max-w-4xl mx-auto">
+              <div className="w-8 h-8 rounded-md bg-emerald-900/30 text-emerald-500 border border-emerald-800/50 flex items-center justify-center shrink-0">
+                <Bot size={18} />
+              </div>
+              <div className="flex flex-col items-start">
+                <div className="text-xs text-zinc-500 mb-1 font-mono">SHADOW</div>
+                <div className="flex flex-col gap-2">
+                  <div className="text-xs text-emerald-500/70 font-mono animate-pulse">
+                    {statusMessage || "Analyzing..."}
+                  </div>
+                  <div className="flex gap-1">
+                    <div className="w-1.5 h-1.5 bg-emerald-500/50 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                    <div className="w-1.5 h-1.5 bg-emerald-500/50 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                    <div className="w-1.5 h-1.5 bg-emerald-500/50 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                  </div>
                 </div>
               </div>
             </div>
