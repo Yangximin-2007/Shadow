@@ -6,7 +6,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI } from '@google/genai';
 import Markdown from 'react-markdown';
-import { Send, Bot, User, Briefcase, BookOpen, Settings, BarChart3, Database, Shield, Paperclip, X, FileText, Image as ImageIcon, LogOut, Loader2 } from 'lucide-react';
+import { Send, Bot, User, Briefcase, BookOpen, Settings, BarChart3, Database, Shield, Paperclip, X, FileText, Image as ImageIcon, LogOut, Loader2, Cpu } from 'lucide-react';
 import { auth, db, googleProvider } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { collection, query, orderBy, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
@@ -63,6 +63,8 @@ export default function App() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [attachments, setAttachments] = useState<File[]>([]);
+  const [useOllama, setUseOllama] = useState(false);
+  const [ollamaModel, setOllamaModel] = useState('llama3');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -175,37 +177,71 @@ export default function App() {
       setInput('');
       setAttachments([]);
 
-      // Format history for Gemini API (excluding the local system-init message if it wasn't saved)
-      const history = messages.filter(m => m.id !== 'system-init').map(msg => {
-        const parts: any[] = [{ text: msg.content }];
-        if (msg.attachments) {
-          msg.attachments.forEach(att => {
-            parts.push({
-              inlineData: {
-                data: att.data,
-                mimeType: att.mimeType
-              }
-            });
-          });
-        }
-        return { role: msg.role, parts };
-      });
+      let modelResponseText = '';
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-pro-preview',
-        contents: [
-          ...history,
-          { role: 'user', parts: currentParts }
-        ],
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          temperature: 0.2,
+      if (useOllama) {
+        // Local Ollama Logic
+        try {
+          const ollamaHistory = messages.filter(m => m.id !== 'system-init').map(msg => ({
+            role: msg.role === 'model' ? 'assistant' : 'user',
+            content: msg.content
+          }));
+
+          const response = await fetch('http://localhost:11434/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: ollamaModel,
+              messages: [
+                { role: 'system', content: SYSTEM_INSTRUCTION },
+                ...ollamaHistory,
+                { role: 'user', content: input }
+              ],
+              stream: false,
+            }),
+          });
+
+          if (!response.ok) throw new Error('Ollama connection failed. Ensure Ollama is running with OLLAMA_ORIGINS="*"');
+          
+          const data = await response.json();
+          modelResponseText = data.message.content;
+        } catch (err) {
+          throw new Error('Ollama Error: ' + (err instanceof Error ? err.message : String(err)));
         }
-      });
+      } else {
+        // Gemini Logic
+        const history = messages.filter(m => m.id !== 'system-init').map(msg => {
+          const parts: any[] = [{ text: msg.content }];
+          if (msg.attachments) {
+            msg.attachments.forEach(att => {
+              parts.push({
+                inlineData: {
+                  data: att.data,
+                  mimeType: att.mimeType
+                }
+              });
+            });
+          }
+          return { role: msg.role, parts };
+        });
+
+        const response = await ai.models.generateContent({
+          model: 'gemini-3.1-pro-preview',
+          contents: [
+            ...history,
+            { role: 'user', parts: currentParts }
+          ],
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            temperature: 0.2,
+          }
+        });
+        modelResponseText = response.text || 'No response generated.';
+      }
 
       const modelMessageData = {
         role: 'model',
-        content: response.text || 'No response generated.',
+        content: modelResponseText,
         createdAt: serverTimestamp()
       };
 
@@ -213,12 +249,12 @@ export default function App() {
       await addDoc(collection(db, 'users', user.uid, 'messages'), modelMessageData);
 
     } catch (error) {
-      console.error("Error calling Gemini or Firestore:", error);
+      console.error("Error calling AI or Firestore:", error);
       // Fallback local error message
       setMessages((prev) => [...prev, {
         id: Date.now().toString(),
         role: 'model',
-        content: '⚠️ **System Error:** Connection to core logic or database failed. Please check API configuration or file size limits (Firestore max 1MB per document).'
+        content: `⚠️ **System Error:** ${error instanceof Error ? error.message : 'Connection failed.'} \n\n*Tip: If using Ollama, ensure it is running locally with CORS enabled.*`
       }]);
     } finally {
       setIsLoading(false);
@@ -285,6 +321,35 @@ export default function App() {
             <SidebarItem icon={<Database size={18} />} label="Vector Memory" />
             <SidebarItem icon={<Briefcase size={18} />} label="Portfolio Models" />
           </nav>
+
+          <div className="px-4 mt-8 mb-2 text-xs font-semibold text-zinc-500 uppercase tracking-wider">Compute Engine</div>
+          <div className="px-4 space-y-3">
+            <div className="flex items-center justify-between p-2 bg-zinc-950 rounded-lg border border-zinc-800">
+              <div className="flex items-center gap-2">
+                <Cpu size={14} className={useOllama ? "text-emerald-500" : "text-zinc-500"} />
+                <span className="text-xs font-medium">Ollama Mode</span>
+              </div>
+              <button 
+                onClick={() => setUseOllama(!useOllama)}
+                className={`w-8 h-4 rounded-full transition-colors relative ${useOllama ? 'bg-emerald-600' : 'bg-zinc-700'}`}
+              >
+                <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${useOllama ? 'left-4.5' : 'left-0.5'}`} />
+              </button>
+            </div>
+            
+            {useOllama && (
+              <select 
+                value={ollamaModel}
+                onChange={(e) => setOllamaModel(e.target.value)}
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-2 text-xs text-zinc-300 focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
+              >
+                <option value="llama3">Llama 3 (8B)</option>
+                <option value="llama3:70b">Llama 3 (70B)</option>
+                <option value="mistral">Mistral</option>
+                <option value="phi3">Phi-3</option>
+              </select>
+            )}
+          </div>
         </div>
 
         <div className="p-4 border-t border-zinc-800">
@@ -315,7 +380,7 @@ export default function App() {
             <h2 className="font-medium text-zinc-100">Terminal: Shadow</h2>
           </div>
           <div className="text-xs font-mono text-zinc-500 bg-zinc-900 px-3 py-1 rounded-full border border-zinc-800">
-            MODEL: GEMINI-2.5-PRO
+            ENGINE: {useOllama ? `OLLAMA (${ollamaModel.toUpperCase()})` : 'GEMINI-3.1-PRO'}
           </div>
         </header>
 
