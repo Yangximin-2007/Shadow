@@ -8,16 +8,13 @@ This contains everything you need to run your app locally.
 
 View your app in AI Studio: https://ai.studio/apps/0a2373ed-ffd8-48c8-ab9f-45e0c40dd96f
 
-## Run Locally
+🚀 ##快速开始
+克隆本项目到本地：git clone https://github.com/[你的用户名]/[仓库名].git
 
-**Prerequisites:**  Node.js
+安装环境依赖：pip install -r requirements.txt
 
-
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+运行微终端：python terminal_ui.py
+(注：由于模型文件体积过大，本项目未包含 Qwen 模型权重，需自行下载并在本地配置 API 接口)
 
 
 # 📈 影子分析师 (Shadow Analyst) - 基于 RAG 与本地大语言模型的金融投研助手
