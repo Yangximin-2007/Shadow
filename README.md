@@ -8,11 +8,11 @@ This contains everything you need to run your app locally.
 
 View your app in AI Studio: https://ai.studio/apps/0a2373ed-ffd8-48c8-ab9f-45e0c40dd96f
 
-🚀 ##快速开始
+## 🚀 快速开始
+
+
 克隆本项目到本地：git clone https://github.com/[你的用户名]/[仓库名].git
-
 安装环境依赖：pip install -r requirements.txt
-
 运行微终端：python terminal_ui.py
 (注：由于模型文件体积过大，本项目未包含 Qwen 模型权重，需自行下载并在本地配置 API 接口)
 
